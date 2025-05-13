@@ -7,7 +7,9 @@ use tokenizers::Tokenizer;
 use std::path::{Path, PathBuf};
 use polars::prelude::*;
 use glob::glob;
-use std::fs::File;
+use std::{fs::File, io::Write};
+//use libc::c_char;
+use polars::lazy::dsl::col;
 
 #[no_mangle]
 pub extern "C" fn load_tokenizer(path: *const c_char) -> *mut Tokenizer {
@@ -129,51 +131,58 @@ pub extern "C" fn free_encoded_batch(ptrs: *mut *mut u32, lengths: *const usize,
 }
 
 
-
 #[no_mangle]
-pub extern "C" fn analyze_network_dir(dir_path: *const c_char, top_n: i32) -> i32 {
-    // Convert path
-    let c_str = unsafe { CStr::from_ptr(dir_path) };
-    let dir_str = match c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
+pub extern "C" fn analyze_network_dir(
+    dir_path: *const c_char,
+    top_n: i32
+) -> i32 {
+    // 1) CStr → &str → PathBuf
+    let dir_str = unsafe {
+        CStr::from_ptr(dir_path)
+            .to_str()
+            .map_err(|_| 1)
+            .unwrap()
     };
-    let dir = Path::new(dir_str);
+    let dir = PathBuf::from(dir_str);
 
-    let pattern = dir.join("*.csv").to_string_lossy().to_string();
-    let mut frames = vec![];
-
-    // Read all CSVs
-    for entry in glob(&pattern).expect("Bad pattern") {
-        match entry {
-            Ok(path) => {
-                let file = match File::open(&path) {
-                    Ok(f) => f,
-                    Err(_) => return 1,
-                };
-                match CsvReader::new(file)
-                    .has_header(true)
-                    .finish()
-                {
-                    Ok(df) => frames.push(df),
-                    Err(_) => return 2,
-                }
-            }
+    // 2) Glob all CSVs
+    let pattern = format!("{}/**/*.csv", dir.display());
+    let mut frames = Vec::new();
+    for entry in glob(&pattern).expect("Invalid glob pattern") {
+        let path = match entry {
+            Ok(p) => p,
             Err(_) => return 3,
-        }
+        };
+
+        // --- the “docs‐style” CSV reader: CsvReadOptions + try_into_reader_with_file_path
+        let df = match CsvReadOptions::default()
+            .with_has_header(true)
+            .try_into_reader_with_file_path(Some(path.clone())) // gives you a CsvReader<File>
+        {
+            Ok(mut rdr) => match rdr.finish() {
+                Ok(df) => df,
+                Err(_) => return 2,
+            },
+            Err(_) => return 2,
+        };
+
+        frames.push(df);
     }
-    
 
     if frames.is_empty() {
         return 4;
     }
 
-    let concat = concat_df(&frames).unwrap();
+    // 3) Eagerly concatenate
+    let mut combined = frames
+        .into_iter()
+        .reduce(|mut acc, df| { acc.vstack_mut(&df).unwrap(); acc })
+        .unwrap();
 
-    // Group and count
-    let grouped = concat
+    // 4) Lazy group/count/sort/limit
+    let result = combined
         .lazy()
-        .group_by([
+        .group_by(vec![
             col("source_ip"),
             col("source_port"),
             col("dest_ip"),
@@ -181,30 +190,42 @@ pub extern "C" fn analyze_network_dir(dir_path: *const c_char, top_n: i32) -> i3
             col("protocol"),
             col("label"),
         ])
-        .agg([count().alias("count")])
-        .sort("count", SortOptions {
-            descending: true,
-            ..Default::default()
-        })
+        .agg(vec![col("*").count().alias("count")])
+        .sort_by_exprs(vec![col("count")],
+		       SortMultipleOptions::default()
+		       .with_order_descending(true)
+		       .with_nulls_last(true),
+	)
         .limit(top_n as u32)
-        .collect();
+        .collect()
+        .map_err(|_| 5);
 
-    let final_df = match grouped {
+    let mut final_df = match result {
         Ok(df) => df,
-        Err(_) => return 5,
+        Err(code) => return code,
     };
 
-    // Write to Parquet
-    let out_path = dir
+    // 5) Parquet write
+    let filename = dir
         .file_name()
         .map(|n| format!("{}_top.parquet", n.to_string_lossy()))
-        .unwrap_or_else(|| "top.parquet".to_string());
+        .unwrap_or_else(|| "top.parquet".into());
+    let out_path = dir.join(filename);
 
-    if let Err(_) = ParquetWriter::new(Path::new(&out_path)).finish(&final_df) {
+    let mut f = match File::create(&out_path) {
+        Ok(f) => f,
+        Err(_) => return 6,
+    };
+    if ParquetWriter::new(&mut f)
+        .finish(&mut final_df)
+        .is_err()
+    {
         return 6;
     }
 
     0
 }
+
+
 
 

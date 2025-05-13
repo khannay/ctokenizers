@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 tokenizers = "0.21"
-polars = { version = "0.46", features = ["parquet", "csv", "lazy"] }
+polars = { version = "0.46.0", features = ["parquet", "csv", "lazy", "polars-io"] }
 glob = "0.3"
+libc  = "0.2"
 
 [lib]
 crate-type = ["cdylib"]
