@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use polars::prelude::*;
 use glob::glob;
 use std::{fs::File, io::Write};
-//use libc::c_char;
-use polars::lazy::dsl::col;
+use polars::lazy::dsl::{col}; 
+use polars::prelude::SortMultipleOptions;
+
 
 #[no_mangle]
 pub extern "C" fn load_tokenizer(path: *const c_char) -> *mut Tokenizer {
@@ -190,12 +191,10 @@ pub extern "C" fn analyze_network_dir(
             col("protocol"),
             col("label"),
         ])
-        .agg(vec![col("*").count().alias("count")])
-        .sort_by_exprs(vec![col("count")],
-		       SortMultipleOptions::default()
-		       .with_order_descending(true)
-		       .with_nulls_last(true),
-	)
+        .agg(vec![
+            len().alias("count")  // Fixed: Use len() instead of col("*").count()
+        ])
+        .sort(["count"], SortMultipleOptions::new().with_order_descending(true))
         .limit(top_n as u32)
         .collect()
         .map_err(|_| 5);
